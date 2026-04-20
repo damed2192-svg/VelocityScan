@@ -1,2 +1,24 @@
-# VelocityScan
-là một công cụ bảo mật mã nguồn mở được thiết kế để tự động hóa việc phát hiện các lỗ hổng SQL Injection trên các ứng dụng web. Được viết bằng Go, công cụ này tận dụng tối đa khả năng của Goroutines để thực hiện hàng loạt truy vấn cùng lúc mà vẫn đảm bảo tiêu tốn ít tài nguyên hệ thống nhất có thể
+vps-manager/
+├── cmd/
+│   └── server/
+│       └── main.go                 # Điểm vào chính của ứng dụng
+├── internal/
+│   ├── api/
+│   │   ├── handlers.go             # HTTP handlers cho REST API
+│   │   └── routes.go               # Định nghĩa routes
+│   ├── docker/
+│   │   ├── client.go               # Docker client wrapper
+│   │   ├── container.go            # Quản lý container
+│   │   └── volume.go               # Quản lý volumes
+│   ├── models/
+│   │   └── vps.go                  # Data models
+│   └── config/
+│       └── config.go               # Cấu hình ứng dụng
+├── scripts/
+│   └── init.sh                     # Script khởi tạo
+├── data/                           # Thư mục lưu trữ volumes
+├── go.mod
+├── go.sum
+├── Dockerfile                      # Dockerfile cho ứng dụng manager
+├── docker-compose.yml              # Docker Compose để chạy toàn bộ
+└── README.md

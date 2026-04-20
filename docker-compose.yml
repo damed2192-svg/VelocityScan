@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  vps-manager:
+    build: .
+    container_name: vps-manager
+    ports:
+      - "8080:8080"
+    environment:
+      - API_PORT=8080
+      - DATA_DIR=/data
+      - DEFAULT_IMAGE=ubuntu:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Mount Docker socket
+      - ./data:/data  # Mount data directory for persistent storage
+    restart: unless-stopped
+    networks:
+      - vps-network
+
+networks:
+  vps-network:
+    driver: bridge
